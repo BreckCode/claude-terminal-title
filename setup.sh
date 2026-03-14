@@ -162,6 +162,8 @@ info "Configuring Claude Code hook..."
 
 mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
 
+CTT_HOOK_ENTRY='{"hooks":[{"type":"command","command":"ctt '\''Claude: Ready'\''"}]}'
+
 if [[ ! -f "$CLAUDE_SETTINGS" ]]; then
   # Create new settings file with the hook
   cat > "$CLAUDE_SETTINGS" <<'SETTINGS'
@@ -169,32 +171,50 @@ if [[ ! -f "$CLAUDE_SETTINGS" ]]; then
   "hooks": {
     "SessionStart": [
       {
-        "type": "command",
-        "command": "ctt 'Claude: Ready'"
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ctt 'Claude: Ready'"
+          }
+        ]
       }
     ]
   }
 }
 SETTINGS
   success "Created Claude settings with SessionStart hook"
+elif grep -q "ctt" "$CLAUDE_SETTINGS" 2>/dev/null; then
+  success "SessionStart hook already configured"
+elif command -v jq &>/dev/null; then
+  # Use jq to safely merge the hook into existing settings
+  TEMP_SETTINGS=$(mktemp)
+  jq '
+    .hooks //= {} |
+    .hooks.SessionStart //= [] |
+    .hooks.SessionStart += [{"hooks":[{"type":"command","command":"ctt '\''Claude: Ready'\''"}]}]
+  ' "$CLAUDE_SETTINGS" > "$TEMP_SETTINGS" && mv "$TEMP_SETTINGS" "$CLAUDE_SETTINGS"
+  success "Added SessionStart hook to existing Claude settings"
+elif command -v python3 &>/dev/null; then
+  # Fallback: use python3 to merge JSON
+  python3 -c "
+import json
+with open('$CLAUDE_SETTINGS', 'r') as f:
+    settings = json.load(f)
+hook_entry = {'hooks': [{'type': 'command', 'command': \"ctt 'Claude: Ready'\"}]}
+settings.setdefault('hooks', {})
+settings['hooks'].setdefault('SessionStart', [])
+settings['hooks']['SessionStart'].append(hook_entry)
+with open('$CLAUDE_SETTINGS', 'w') as f:
+    json.dump(settings, f, indent=2)
+    f.write('\n')
+"
+  success "Added SessionStart hook to existing Claude settings"
 else
-  # Check if hook already exists
-  if grep -q "ctt" "$CLAUDE_SETTINGS" 2>/dev/null; then
-    success "SessionStart hook already configured"
-  else
-    warn "Claude settings file exists. Add the following hook manually:"
-    echo ""
-    echo '  "hooks": {'
-    echo '    "SessionStart": ['
-    echo '      {'
-    echo '        "type": "command",'
-    echo '        "command": "ctt '\''Claude: Ready'\''"'
-    echo '      }'
-    echo '    ]'
-    echo '  }'
-    echo ""
-    warn "Add the above to: ${CLAUDE_SETTINGS}"
-  fi
+  warn "Neither jq nor python3 found. Add this to ${CLAUDE_SETTINGS} manually:"
+  echo ''
+  echo '  "hooks": {'
+  echo '    "SessionStart": [{ "hooks": [{ "type": "command", "command": "ctt '\''Claude: Ready'\''" }] }]'
+  echo '  }'
 fi
 
 # --- Summary ---
