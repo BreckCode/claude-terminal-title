@@ -59,6 +59,17 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     warn "Check ${CLAUDE_SETTINGS} and remove the SessionStart hook for ctt if present."
   fi
 
+  # Ensure no ctt remains anywhere in PATH
+  while command -v ctt &>/dev/null; do
+    REMAINING=$(command -v ctt)
+    if [[ -w "$(dirname "$REMAINING")" ]]; then
+      rm -f "$REMAINING"
+    else
+      sudo rm -f "$REMAINING"
+    fi
+    success "Removed ctt from $REMAINING"
+  done
+
   echo ""
   success "Uninstall complete!"
   exit 0
