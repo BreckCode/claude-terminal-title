@@ -51,6 +51,25 @@ fi
 
 TITLE="$1"
 
+# --- Collect ancestor PIDs for terminal identification ---
+get_ancestor_pids() {
+  local pids="[]"
+  local current_pid="$$"
+  local collected=()
+
+  for _ in $(seq 1 20); do
+    current_pid=$(ps -o ppid= -p "$current_pid" 2>/dev/null | tr -d ' ') || break
+    [[ -z "$current_pid" || "$current_pid" == "0" || "$current_pid" == "1" ]] && break
+    collected+=("$current_pid")
+  done
+
+  # Build JSON array
+  if [[ ${#collected[@]} -gt 0 ]]; then
+    pids="[$(IFS=,; echo "${collected[*]}")]"
+  fi
+  echo "$pids"
+}
+
 # --- Detect environment and set title ---
 
 is_vscode_terminal() {
@@ -62,10 +81,13 @@ is_vscode_terminal() {
 }
 
 set_title_via_extension() {
+  local ancestor_pids
+  ancestor_pids=$(get_ancestor_pids)
+
   local response
   response=$(curl -sf -X POST "http://${HOST}:${PORT}/title" \
     -H "Content-Type: application/json" \
-    -d "{\"title\": \"${TITLE}\"}" 2>/dev/null) || return 1
+    -d "{\"title\": \"${TITLE}\", \"ancestorPids\": ${ancestor_pids}}" 2>/dev/null) || return 1
   return 0
 }
 

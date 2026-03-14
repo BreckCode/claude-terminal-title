@@ -3,7 +3,9 @@ import * as http from "http";
 
 let server: http.Server | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
-let currentTitle = "";
+
+// Map terminal PID → last title set for that terminal
+const terminalTitles = new Map<number, string>();
 
 export function activate(context: vscode.ExtensionContext) {
   const config = vscode.workspace.getConfiguration("claudeTerminalTitle");
@@ -45,8 +47,12 @@ export function activate(context: vscode.ExtensionContext) {
         });
         req.on("end", () => {
           try {
-            const data = JSON.parse(body) as { title?: string };
+            const data = JSON.parse(body) as {
+              title?: string;
+              ancestorPids?: number[];
+            };
             const title = data.title;
+            const ancestorPids = data.ancestorPids ?? [];
 
             if (typeof title !== "string" || title.length === 0) {
               res.writeHead(400, { "Content-Type": "application/json" });
@@ -54,16 +60,31 @@ export function activate(context: vscode.ExtensionContext) {
               return;
             }
 
-            currentTitle = title;
-            setTerminalTitle(title);
+            // Find the correct terminal by matching ancestor PIDs
+            findTerminalByPids(ancestorPids).then((terminal) => {
+              if (terminal) {
+                renameTerminal(terminal, title);
 
-            if (statusBarItem) {
-              statusBarItem.text = `$(terminal) ${truncate(title, 30)}`;
-              statusBarItem.tooltip = `Claude Terminal Title: ${title}`;
-            }
+                if (statusBarItem) {
+                  statusBarItem.text = `$(terminal) ${truncate(title, 30)}`;
+                  statusBarItem.tooltip = `Claude Terminal Title: ${title}`;
+                }
 
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ ok: true, title }));
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ ok: true, title, matched: true }));
+              } else {
+                // No PID match — fall back to active terminal
+                const fallback = vscode.window.activeTerminal;
+                if (fallback) {
+                  renameTerminal(fallback, title);
+                }
+
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(
+                  JSON.stringify({ ok: true, title, matched: false })
+                );
+              }
+            });
           } catch (_err) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "invalid JSON" }));
@@ -77,8 +98,7 @@ export function activate(context: vscode.ExtensionContext) {
         res.end(
           JSON.stringify({
             status: "ok",
-            version: "1.0.0",
-            currentTitle: currentTitle || null,
+            version: "1.1.0",
           })
         );
         return;
@@ -122,11 +142,12 @@ export function activate(context: vscode.ExtensionContext) {
         const title = await vscode.window.showInputBox({
           prompt: "Enter terminal title",
           placeHolder: "e.g., Auth Fix: Planning",
-          value: currentTitle,
         });
         if (title) {
-          currentTitle = title;
-          setTerminalTitle(title);
+          const terminal = vscode.window.activeTerminal;
+          if (terminal) {
+            renameTerminal(terminal, title);
+          }
         }
       }
     )
@@ -135,7 +156,7 @@ export function activate(context: vscode.ExtensionContext) {
   // Reset title command
   context.subscriptions.push(
     vscode.commands.registerCommand("claudeTerminalTitle.resetTitle", () => {
-      currentTitle = "";
+      terminalTitles.clear();
       if (statusBarItem) {
         statusBarItem.text = "$(terminal) CTT";
         statusBarItem.tooltip = "Claude Terminal Title: Active";
@@ -165,50 +186,47 @@ export function activate(context: vscode.ExtensionContext) {
   );
 }
 
-function setTerminalTitle(title: string) {
-  const terminal = findClaudeTerminal() ?? vscode.window.activeTerminal;
-  if (!terminal) {
-    return;
+async function findTerminalByPids(
+  ancestorPids: number[]
+): Promise<vscode.Terminal | undefined> {
+  if (ancestorPids.length === 0) {
+    return undefined;
   }
-  renameTerminal(terminal, title);
-}
 
-function findClaudeTerminal(): vscode.Terminal | undefined {
+  const pidSet = new Set(ancestorPids);
   const terminals = vscode.window.terminals;
 
-  // First pass: look for terminal with Claude-related name
-  for (const terminal of terminals) {
-    const name = terminal.name.toLowerCase();
-    if (name.includes("claude") || name.includes("ctt")) {
-      return terminal;
-    }
-  }
-
-  // Second pass: look for terminal with a previous title set by us
-  if (currentTitle) {
-    for (const terminal of terminals) {
-      if (terminal.name === currentTitle) {
+  // Check each terminal's shell PID against the ancestor list
+  const results = await Promise.all(
+    terminals.map(async (terminal) => {
+      const pid = await terminal.processId;
+      if (pid !== undefined && pidSet.has(pid)) {
         return terminal;
       }
-    }
-  }
+      return undefined;
+    })
+  );
 
-  // Fall back to active terminal
-  return vscode.window.activeTerminal;
+  return results.find((t) => t !== undefined);
 }
 
 function renameTerminal(terminal: vscode.Terminal, title: string) {
-  // Focus the terminal first (required for rename command)
+  // Store the title for this terminal
+  terminal.processId.then((pid) => {
+    if (pid !== undefined) {
+      terminalTitles.set(pid, title);
+    }
+  });
+
+  // Focus the target terminal, then rename it
   terminal.show(false);
 
-  // Use the VS Code rename command with argument
   vscode.commands
     .executeCommand("workbench.action.terminal.renameWithArg", {
       name: title,
     })
     .then(undefined, () => {
-      // Fallback for older VS Code versions: send escape sequence
-      // Requires terminal.integrated.tabs.title to include ${sequence}
+      // Fallback: send escape sequence
       const escaped = title.replace(/'/g, "'\\''");
       terminal.sendText(`printf '\\033]0;${escaped}\\007'`, true);
     });
