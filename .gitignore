@@ -1,0 +1,6 @@
+node_modules/
+out/
+*.map
+.vscode-test/
+.DS_Store
+extension/claude-terminal-title-*.vsix
