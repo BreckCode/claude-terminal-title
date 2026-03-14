@@ -6,15 +6,23 @@ Automatically updates your terminal tab title based on what Claude Code is doing
 ![license](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-macOS%20|%20Linux-lightgrey?style=flat-square)
 
+## The Problem
+
+When you're running multiple Claude Code sessions in different terminals, every tab shows something like `2.1.76` or `claude` — which tells you nothing about what each session is actually working on. You end up clicking through tabs trying to find the right one.
+
+And you can't just change the title yourself — VS Code (and its forks like Cursor, VSCodium) ignores terminal title escape sequences. Claude Code runs commands in a captured subprocess, so even `printf '\033]0;title\007'` doesn't reach the terminal emulator. There's no built-in way to set a meaningful title.
+
+This tool fixes that.
+
 ## What It Does
 
-When Claude Code works on a task, the terminal tab title updates in real-time:
+With Claude Terminal Title installed, Claude automatically updates the terminal tab as it works:
 
 ```
 Auth Fix: Planning  →  Auth Fix: Building  →  Auth Fix: (3/5)  →  Auth Fix: Testing  →  Auth Fix: Done
 ```
 
-No more guessing what Claude is doing — just glance at the tab.
+Now when you have 3-4 Claude sessions running, each tab shows exactly what that session is doing. No more guessing — just glance at the tabs.
 
 ## How It Works
 
