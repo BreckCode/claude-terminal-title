@@ -6,6 +6,16 @@ import { execSync } from "child_process";
 let server: http.Server | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
 
+// Active titles: TTY device path → { title, intervalId }
+// We periodically re-write the escape sequence to override Claude Code's own title
+const activeTitles = new Map<
+  string,
+  { title: string; interval: ReturnType<typeof setInterval> }
+>();
+
+// Cache: terminal PID → TTY device path
+const ttyCache = new Map<number, string>();
+
 export function activate(context: vscode.ExtensionContext) {
   const config = vscode.workspace.getConfiguration("claudeTerminalTitle");
   const enabled = config.get<boolean>("enabled", true);
@@ -28,6 +38,20 @@ export function activate(context: vscode.ExtensionContext) {
   statusBarItem.tooltip = "Claude Terminal Title: Active";
   statusBarItem.show();
   context.subscriptions.push(statusBarItem);
+
+  // Clean up intervals when terminals close
+  context.subscriptions.push(
+    vscode.window.onDidCloseTerminal(async (terminal) => {
+      const pid = await terminal.processId;
+      if (pid !== undefined) {
+        const tty = ttyCache.get(pid);
+        if (tty) {
+          stopTitleLoop(tty);
+          ttyCache.delete(pid);
+        }
+      }
+    })
+  );
 
   // HTTP server
   server = http.createServer(
@@ -87,12 +111,16 @@ export function activate(context: vscode.ExtensionContext) {
             tty: await getTtyDevice(t),
           }))
         ).then((terminalInfo) => {
+          const activeLoops = Array.from(activeTitles.entries()).map(
+            ([tty, entry]) => ({ tty, title: entry.title })
+          );
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
               status: "ok",
-              version: "3.0.0",
+              version: "4.0.0",
               terminals: terminalInfo,
+              activeLoops,
             })
           );
         });
@@ -122,6 +150,10 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push({
     dispose: () => {
+      // Stop all title loops
+      for (const [tty] of activeTitles) {
+        stopTitleLoop(tty);
+      }
       if (server) {
         server.close();
         server = undefined;
@@ -141,21 +173,27 @@ export function activate(context: vscode.ExtensionContext) {
         if (title) {
           const terminal = vscode.window.activeTerminal;
           if (terminal) {
-            await setTitleViaTty(terminal, title);
+            const tty = await getTtyDevice(terminal);
+            if (tty) {
+              startTitleLoop(tty, title);
+            }
           }
         }
       }
     )
   );
 
-  // Reset title command
+  // Reset title command — stops all loops
   context.subscriptions.push(
     vscode.commands.registerCommand("claudeTerminalTitle.resetTitle", () => {
+      for (const [tty] of activeTitles) {
+        stopTitleLoop(tty);
+      }
       if (statusBarItem) {
         statusBarItem.text = "$(terminal) CTT";
         statusBarItem.tooltip = "Claude Terminal Title: Active";
       }
-      vscode.window.showInformationMessage("Terminal titles cleared.");
+      vscode.window.showInformationMessage("All terminal titles cleared.");
     })
   );
 
@@ -180,13 +218,13 @@ export function activate(context: vscode.ExtensionContext) {
   );
 }
 
-// Set terminal.integrated.tabs.title to include ${sequence} if not already
 function ensureTabTitleSetting() {
-  const termConfig = vscode.workspace.getConfiguration("terminal.integrated.tabs");
+  const termConfig = vscode.workspace.getConfiguration(
+    "terminal.integrated.tabs"
+  );
   const currentTitle = termConfig.get<string>("title", "${process}");
 
   if (!currentTitle.includes("${sequence}")) {
-    // Set to: show sequence (our title) if set, otherwise show process name
     termConfig.update(
       "title",
       "${sequence}${separator}${process}",
@@ -201,69 +239,103 @@ async function handleTitleRequest(
 ): Promise<{ method: string; matchedPid?: number; tty?: string }> {
   const terminals = vscode.window.terminals;
 
-  // Resolve all terminal PIDs
+  // Resolve all terminal PIDs and TTYs
   const terminalEntries = await Promise.all(
     terminals.map(async (t) => ({
       terminal: t,
       pid: await t.processId,
+      tty: await getTtyDevice(t),
     }))
   );
 
-  // Find which terminal this request belongs to via ancestor PID matching
+  // Find which terminal this request belongs to
   const pidSet = new Set(ancestorPids);
-  let targetTerminal: vscode.Terminal | undefined;
-  let matchedPid: number | undefined;
+  let matchedEntry: (typeof terminalEntries)[0] | undefined;
 
   for (const entry of terminalEntries) {
     if (entry.pid !== undefined && pidSet.has(entry.pid)) {
-      targetTerminal = entry.terminal;
-      matchedPid = entry.pid;
+      matchedEntry = entry;
       break;
     }
   }
 
-  // If no PID match and only one terminal, use it
-  if (!targetTerminal && terminals.length === 1) {
-    targetTerminal = terminals[0];
-    matchedPid = terminalEntries[0]?.pid;
-  }
-
-  // If still no match, use active terminal
-  if (!targetTerminal) {
-    targetTerminal = vscode.window.activeTerminal;
-    if (targetTerminal) {
-      matchedPid = await targetTerminal.processId;
+  // Fallback: single terminal or active terminal
+  if (!matchedEntry) {
+    if (terminals.length === 1) {
+      matchedEntry = terminalEntries[0];
+    } else {
+      const active = vscode.window.activeTerminal;
+      if (active) {
+        matchedEntry = terminalEntries.find((e) => e.terminal === active);
+      }
     }
   }
 
-  if (!targetTerminal) {
-    return { method: "no-terminal" };
+  if (!matchedEntry || !matchedEntry.tty) {
+    return { method: "no-tty", matchedPid: matchedEntry?.pid };
   }
 
-  // Write escape sequence directly to the terminal's TTY device
-  const tty = await setTitleViaTty(targetTerminal, title);
+  // Start (or update) the title loop for this terminal's TTY
+  startTitleLoop(matchedEntry.tty, title);
 
-  if (tty) {
-    return { method: "tty-direct", matchedPid, tty };
-  }
-
-  // Fallback: use renameWithArg (only works on active terminal)
-  if (targetTerminal === vscode.window.activeTerminal) {
-    try {
-      await vscode.commands.executeCommand(
-        "workbench.action.terminal.renameWithArg",
-        { name: title }
-      );
-      return { method: "rename-command", matchedPid };
-    } catch {
-      // ignore
-    }
-  }
-
-  return { method: "failed", matchedPid };
+  return {
+    method: "tty-loop",
+    matchedPid: matchedEntry.pid,
+    tty: matchedEntry.tty,
+  };
 }
 
-// Get the TTY device path for a terminal
+// Write the escape sequence once
+function writeTitleToTty(ttyPath: string, title: string): boolean {
+  try {
+    const escapeSequence = `\x1b]0;${title}\x07`;
+    fs.writeFileSync(ttyPath, escapeSequence, { encoding: "utf8" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Start a loop that keeps writing our title every second
+// This overrides Claude Code's own title updates
+function startTitleLoop(ttyPath: string, title: string) {
+  // If already running for this TTY, update the title and keep the loop
+  const existing = activeTitles.get(ttyPath);
+  if (existing) {
+    existing.title = title;
+    // Write immediately with new title
+    writeTitleToTty(ttyPath, title);
+    return;
+  }
+
+  // Write immediately
+  writeTitleToTty(ttyPath, title);
+
+  // Then keep writing every second to override Claude Code's title
+  const interval = setInterval(() => {
+    const entry = activeTitles.get(ttyPath);
+    if (!entry) {
+      return;
+    }
+    const ok = writeTitleToTty(ttyPath, entry.title);
+    if (!ok) {
+      // TTY gone (terminal closed) — stop the loop
+      stopTitleLoop(ttyPath);
+    }
+  }, 1000);
+
+  activeTitles.set(ttyPath, { title, interval });
+}
+
+// Stop the title loop for a TTY
+function stopTitleLoop(ttyPath: string) {
+  const entry = activeTitles.get(ttyPath);
+  if (entry) {
+    clearInterval(entry.interval);
+    activeTitles.delete(ttyPath);
+  }
+}
+
 async function getTtyDevice(
   terminal: vscode.Terminal
 ): Promise<string | null> {
@@ -272,8 +344,13 @@ async function getTtyDevice(
     return null;
   }
 
+  // Check cache first
+  const cached = ttyCache.get(pid);
+  if (cached) {
+    return cached;
+  }
+
   try {
-    // Get the TTY device from the process
     const ttyRaw = execSync(`ps -o tty= -p ${pid}`, {
       encoding: "utf8",
       timeout: 2000,
@@ -283,45 +360,19 @@ async function getTtyDevice(
       return null;
     }
 
-    // Build the full device path
-    // macOS: ps returns "ttys065" → /dev/ttys065
-    // Linux: ps returns "pts/0" → /dev/pts/0
     let devicePath: string;
     if (ttyRaw.startsWith("/dev/")) {
       devicePath = ttyRaw;
-    } else if (ttyRaw.startsWith("pts/") || ttyRaw.startsWith("tty")) {
-      devicePath = `/dev/${ttyRaw}`;
     } else {
       devicePath = `/dev/${ttyRaw}`;
     }
 
     if (fs.existsSync(devicePath)) {
+      ttyCache.set(pid, devicePath);
       return devicePath;
     }
 
     return null;
-  } catch {
-    return null;
-  }
-}
-
-// Write OSC escape sequence directly to the terminal's TTY device
-// This sets the title without switching terminals — no flicker
-async function setTitleViaTty(
-  terminal: vscode.Terminal,
-  title: string
-): Promise<string | null> {
-  const devicePath = await getTtyDevice(terminal);
-  if (!devicePath) {
-    return null;
-  }
-
-  try {
-    // Write OSC 0 (Set Window Title) escape sequence
-    // \x1b]0;title\x07
-    const escapeSequence = `\x1b]0;${title}\x07`;
-    fs.writeFileSync(devicePath, escapeSequence, { encoding: "utf8" });
-    return devicePath;
   } catch {
     return null;
   }
@@ -335,6 +386,9 @@ function truncate(str: string, maxLen: number): string {
 }
 
 export function deactivate() {
+  for (const [tty] of activeTitles) {
+    stopTitleLoop(tty);
+  }
   if (server) {
     server.close();
     server = undefined;
