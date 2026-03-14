@@ -29,7 +29,7 @@ Claude Code  ──ctt command──▶  Local HTTP Server  ──VS Code API─
 ## Quick Setup
 
 ```bash
-git clone https://github.com/ASeaCat/claude-terminal-title.git
+git clone https://github.com/BreckCode/claude-terminal-title.git
 cd claude-terminal-title
 bash setup.sh
 ```
